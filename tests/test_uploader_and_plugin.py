@@ -158,6 +158,9 @@ class UploaderAndPluginTests(unittest.IsolatedAsyncioTestCase):
                     joined = [r for r in (r1, r2, r3) if "已在下载中" in r]
                     self.assertEqual(len(started), 1, msg=(r1, r2, r3))
                     self.assertEqual(len(joined), 2, msg=(r1, r2, r3))
+                    for reply in (r1, r2, r3):
+                        self.assertIn("查进度：/dl list", reply)
+                        self.assertIn("取消：/dl cancel ", reply)
 
                     for _ in range(50):
                         if len(ctx.sent) >= 2 and not plugin._jobs_by_id:

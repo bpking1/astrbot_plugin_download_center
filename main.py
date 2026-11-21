@@ -249,10 +249,7 @@ class DownloadCenterPlugin(Star):
             if existing_job is not None:
                 if umo not in existing_job.waiters:
                     existing_job.waiters[umo] = clean_name
-                return (
-                    f"该链接已在下载中（任务 {existing_job.job_id}，「{existing_job.filename}」），"
-                    "完成后会自动上传到当前会话。"
-                )
+                return self._format_inflight_reply(existing_job)
 
             if not force and not self._cfg_bool("revalidate_cache_with_head", False):
                 cached = store.lookup(clean_url)
@@ -274,10 +271,7 @@ class DownloadCenterPlugin(Star):
             if existing_job is not None:
                 if umo not in existing_job.waiters:
                     existing_job.waiters[umo] = clean_name
-                return (
-                    f"该链接已在下载中（任务 {existing_job.job_id}，「{existing_job.filename}」），"
-                    "完成后会自动上传到当前会话。"
-                )
+                return self._format_inflight_reply(existing_job)
 
             if not force:
                 cached = store.lookup(clean_url) or store.lookup(probe_res.final_url)
@@ -314,6 +308,14 @@ class DownloadCenterPlugin(Star):
         return (
             f"已开始后台下载「{probe_res.filename}」（{format_bytes(probe_res.total_size)}，"
             f"{mode_hint}，任务 {job.job_id}），完成后会自动上传。"
+            f"查进度：/dl list，取消：/dl cancel {job.job_id}"
+        )
+
+    @staticmethod
+    def _format_inflight_reply(job: DownloadJob) -> str:
+        return (
+            f"该链接已在下载中（任务 {job.job_id}，「{job.filename}」），"
+            f"完成后会自动上传到当前会话。查进度：/dl list，取消：/dl cancel {job.job_id}"
         )
 
     def _is_cache_still_fresh(self, cached: CacheEntry, probe_res: ProbeResult) -> bool:
