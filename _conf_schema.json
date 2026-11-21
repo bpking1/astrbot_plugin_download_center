@@ -105,5 +105,74 @@
     "description": "自定义请求 User-Agent",
     "type": "string",
     "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  },
+  "baidu_pan": {
+    "description": "百度网盘设置（SVIP 转存 + OpenList 取直链）",
+    "hint": "需先在 OpenList 挂载 BaiduNetdisk 驱动（建议 official 接口），并在此填写百度 Cookie 与 OpenList 令牌。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用百度网盘下载",
+        "type": "bool",
+        "default": false
+      },
+      "cookie": {
+        "description": "百度网盘 Cookie",
+        "hint": "至少包含 BDUSS=...; STOKEN=...，用于验证分享链接与转存文件到临时目录。",
+        "type": "string",
+        "default": ""
+      },
+      "openlist_url": {
+        "description": "OpenList 服务地址",
+        "hint": "填写 AstrBot 容器可直接访问的 OpenList 地址，例如 http://192.168.10.2:5244。",
+        "type": "string",
+        "default": "http://192.168.10.2:5244"
+      },
+      "openlist_token": {
+        "description": "OpenList 管理员令牌（Token）",
+        "hint": "在 OpenList 后台「设置 -> 其他 -> 令牌」复制。",
+        "type": "string",
+        "default": ""
+      },
+      "openlist_mount_path": {
+        "description": "OpenList 中百度网盘挂载路径",
+        "hint": "必须与 OpenList 存储配置里的挂载路径一致，例如 /baidu。",
+        "type": "string",
+        "default": "/baidu"
+      },
+      "temp_dir": {
+        "description": "百度网盘临时转存目录",
+        "hint": "插件会在此目录下按任务建子目录并在下载完成后自动删除，例如 /bot_tmp。",
+        "type": "string",
+        "default": "/bot_tmp"
+      },
+      "connections": {
+        "description": "百度直链并发分片数",
+        "hint": "建议设为 2~4，避免过高频并发触发 SVIP 账号限速或风控。",
+        "type": "int",
+        "default": 3
+      },
+      "chunk_size_mb": {
+        "description": "百度直链分片大小（MB）",
+        "type": "int",
+        "default": 8
+      },
+      "max_pick_files": {
+        "description": "多文件分享单次最多选号数量",
+        "type": "int",
+        "default": 3
+      },
+      "max_list_files": {
+        "description": "多文件分享最多展开展示文件数",
+        "type": "int",
+        "default": 50
+      },
+      "max_downloads_per_day": {
+        "description": "每日百度通道最大解析下载次数",
+        "hint": "设为 0 表示不限制；命中本地缓存秒传不计入当日次数。",
+        "type": "int",
+        "default": 30
+      }
+    }
   }
 }

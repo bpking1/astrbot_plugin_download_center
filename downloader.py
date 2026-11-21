@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import ipaddress
 import json
@@ -65,6 +65,7 @@ class DownloadOptions:
     allowed_private_hosts: tuple[str, ...] = ()
     proxy: str = ""
     user_agent: str = DEFAULT_USER_AGENT
+    extra_headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -292,6 +293,8 @@ async def _open_following_redirects(
     current_url = url
     req_method = method
     headers = {"User-Agent": options.user_agent}
+    if options.extra_headers:
+        headers.update(options.extra_headers)
     if extra_headers:
         headers.update(extra_headers)
 
@@ -472,11 +475,20 @@ async def _probe_once(
     )
 
 
-def _validators_match(meta: dict, probe_res: ProbeResult, mode: str) -> bool:
+def _validators_match(
+    meta: dict,
+    probe_res: ProbeResult,
+    mode: str,
+    resume_key: str | None = None,
+) -> bool:
     if meta.get("mode") != mode:
         return False
     if meta.get("total_size") != probe_res.total_size:
         return False
+    if resume_key:
+        if meta.get("resume_key") != resume_key:
+            return False
+        return (time.time() - float(meta.get("updated_at", 0))) < META_MAX_AGE_SECONDS
     if probe_res.etag and meta.get("etag"):
         return probe_res.etag == meta.get("etag")
     if probe_res.last_modified and meta.get("last_modified"):
@@ -540,6 +552,7 @@ async def download(
     progress_cb: Callable[[int, int | None], None] | None = None,
     cancel_event: asyncio.Event | None = None,
     session: aiohttp.ClientSession | None = None,
+    resume_key: str | None = None,
 ) -> DownloadResult:
     """Download a URL to tmp_dir/<url_key>.part with chunking, resume, and retries."""
     tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -572,6 +585,7 @@ async def download(
                 options,
                 progress_cb=progress_cb,
                 cancel_event=cancel_event,
+                resume_key=resume_key,
             )
             if result is not None:
                 return result
@@ -584,6 +598,7 @@ async def download(
             options,
             progress_cb=progress_cb,
             cancel_event=cancel_event,
+            resume_key=resume_key,
         )
 
     async def _run_with_session() -> DownloadResult:
@@ -606,6 +621,7 @@ async def _download_multipart(
     options: DownloadOptions,
     progress_cb: Callable[[int, int | None], None] | None = None,
     cancel_event: asyncio.Event | None = None,
+    resume_key: str | None = None,
 ) -> DownloadResult | None:
     total_size = probe_res.total_size
     assert total_size is not None
@@ -625,7 +641,7 @@ async def _download_multipart(
         meta is not None
         and part_path.exists()
         and meta.get("chunk_size") == chunk_size
-        and _validators_match(meta, probe_res, mode="multipart")
+        and _validators_match(meta, probe_res, mode="multipart", resume_key=resume_key)
         and os.path.getsize(part_path) == total_size
     ):
         raw_completed = meta.get("completed_chunks", [])
@@ -641,6 +657,7 @@ async def _download_multipart(
             meta_path,
             {
                 "mode": "multipart",
+                "resume_key": resume_key,
                 "final_url": probe_res.final_url,
                 "etag": probe_res.etag,
                 "last_modified": probe_res.last_modified,
@@ -778,6 +795,7 @@ async def _download_multipart(
                             meta_path,
                             {
                                 "mode": "multipart",
+                                "resume_key": resume_key,
                                 "final_url": probe_res.final_url,
                                 "etag": probe_res.etag,
                                 "last_modified": probe_res.last_modified,
@@ -847,6 +865,7 @@ async def _download_single_stream(
     options: DownloadOptions,
     progress_cb: Callable[[int, int | None], None] | None = None,
     cancel_event: asyncio.Event | None = None,
+    resume_key: str | None = None,
 ) -> DownloadResult:
     meta = _read_meta(meta_path)
     existing_bytes = 0
@@ -856,7 +875,7 @@ async def _download_single_stream(
         probe_res.accept_ranges
         and meta is not None
         and part_path.exists()
-        and _validators_match(meta, probe_res, mode="stream")
+        and _validators_match(meta, probe_res, mode="stream", resume_key=resume_key)
     ):
         size_on_disk = os.path.getsize(part_path)
         if 0 < size_on_disk and (probe_res.total_size is None or size_on_disk <= probe_res.total_size):
@@ -876,6 +895,7 @@ async def _download_single_stream(
             meta_path,
             {
                 "mode": "stream",
+                "resume_key": resume_key,
                 "final_url": probe_res.final_url,
                 "etag": probe_res.etag,
                 "last_modified": probe_res.last_modified,

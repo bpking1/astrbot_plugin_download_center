@@ -66,6 +66,11 @@ def url_key(url: str) -> str:
     return hashlib.sha256(normalize_url(url).encode("utf-8")).hexdigest()
 
 
+def canonical_key_hash(canonical_key: str) -> str:
+    """Return a stable SHA256 hex digest for an arbitrary logical cache key."""
+    return hashlib.sha256(str(canonical_key).encode("utf-8")).hexdigest()
+
+
 @dataclass(slots=True)
 class CacheEntry:
     """A cached file record ready for uploading."""
@@ -189,9 +194,9 @@ class CacheStore:
         with self._lock:
             return self._pins.get(sha256, 0) > 0
 
-    def lookup(self, url: str) -> CacheEntry | None:
-        """Look up a non-expired cached file by URL (or normalized URL alias)."""
-        key = url_key(url)
+    def lookup(self, url: str, canonical_key: str | None = None) -> CacheEntry | None:
+        """Look up a non-expired cached file by URL or explicit logical canonical_key."""
+        key = canonical_key_hash(canonical_key) if canonical_key else url_key(url)
         now = time.time()
         with self._lock:
             row = self._conn.execute(
@@ -241,6 +246,7 @@ class CacheStore:
         result: DownloadResult,
         ttl_hours: int,
         custom_filename: str | None = None,
+        canonical_key: str | None = None,
     ) -> CacheEntry:
         """Persist a downloaded .part file into cache with SHA256 content deduplication."""
         now = time.time()
@@ -309,10 +315,16 @@ class CacheStore:
                     ),
                 )
 
-            for raw_url in {original_url, result.final_url}:
-                if not raw_url:
-                    continue
-                k = url_key(raw_url)
+            if canonical_key:
+                alias_targets = [(canonical_key_hash(canonical_key), canonical_key, canonical_key)]
+            else:
+                alias_targets = [
+                    (url_key(raw_url), original_url, result.final_url)
+                    for raw_url in {original_url, result.final_url}
+                    if raw_url
+                ]
+
+            for k, orig_val, final_val in alias_targets:
                 self._conn.execute(
                     """
                     INSERT INTO url_aliases (url_key, original_url, final_url, sha256, etag, last_modified, updated_at)
@@ -327,8 +339,8 @@ class CacheStore:
                     """,
                     (
                         k,
-                        original_url,
-                        result.final_url,
+                        orig_val,
+                        final_val,
                         result.sha256,
                         result.etag,
                         result.last_modified,

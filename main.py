@@ -1,4 +1,4 @@
-"""AstrBot Download Center plugin: chat-driven file downloader with dedup cache."""
+"""AstrBot Download Center plugin: chat-driven file downloader with dedup cache & Baidu Netdisk."""
 
 from __future__ import annotations
 
@@ -15,7 +15,20 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star, StarTools, register
 
-from .cache_store import CacheEntry, CacheStore, url_key
+from .baidu_pan import (
+    BAIDU_WEB_API_BASE,
+    BaiduConfig,
+    BaiduPanClient,
+    BaiduPanError,
+    BaiduShareFile,
+    BaiduShareMetadata,
+    ShareSessionStore,
+    canonical_baidu_key,
+    extract_baidu_share_info,
+    is_baidu_pan_url,
+    parse_pick_indices,
+)
+from .cache_store import CacheEntry, CacheStore, canonical_key_hash, url_key
 from .downloader import (
     DEFAULT_USER_AGENT,
     DownloadCancelledError,
@@ -29,9 +42,11 @@ from .downloader import (
     sanitize_filename,
     validate_url_and_ssrf,
 )
+from .openlist_client import OpenListClient, OpenListError, join_openlist_path
 from .uploader import UploadError, upload_file_to_session
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_PLAIN_PWD_RE = re.compile(r"^[A-Za-z0-9]{4}$")
 
 
 @dataclass
@@ -55,28 +70,37 @@ class DownloadJob:
 @register(
     "astrbot_plugin_download_center",
     "bpking1",
-    "聊天识别下载需求，支持分片断点续传、去重缓存与自动上传。",
-    "1.0.0",
+    "聊天识别下载需求，支持直链与百度网盘（OpenList）分片续传、去重缓存与自动上传。",
+    "1.1.0",
 )
 class DownloadCenterPlugin(Star):
-    """Chat-driven download center with multi-connection resume, dedup cache, and upload."""
+    """Chat-driven download center with multi-connection resume, dedup cache, and Baidu Netdisk."""
 
     def __init__(
         self,
         context: Context,
         config: Any = None,
         data_dir: Path | None = None,
+        baidu_api_base: str = BAIDU_WEB_API_BASE,
+        openlist_client: OpenListClient | None = None,
     ) -> None:
         super().__init__(context)
-        self.config: dict[str, Any] = config if isinstance(config, dict) or hasattr(config, "get") else {}
+        self.config: dict[str, Any] = (
+            config if isinstance(config, dict) or hasattr(config, "get") else {}
+        )
         self._injected_data_dir = Path(data_dir) if data_dir is not None else None
+        self._baidu_api_base = baidu_api_base
+        self._injected_openlist_client = openlist_client
         self.store: CacheStore | None = None
+        self._share_sessions = ShareSessionStore()
         self._inflight: dict[str, DownloadJob] = {}
         self._jobs_by_id: dict[str, DownloadJob] = {}
         self._lock = asyncio.Lock()
         self._semaphore: asyncio.Semaphore | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._baidu_daily_date: str = ""
+        self._baidu_daily_count: int = 0
 
     async def initialize(self) -> None:
         data_dir = self._injected_data_dir or StarTools.get_data_dir("astrbot_plugin_download_center")
@@ -88,10 +112,12 @@ class DownloadCenterPlugin(Star):
             max_total_bytes=self._cfg_int("cache_max_total_mb", 2048, min_val=0) * 1024 * 1024,
             active_tmp_keys=set(),
         )
+        bcfg = self._build_baidu_config()
         self.logger.info(
-            "下载中心已启动：上限 %d MB，缓存 %d 小时，清理临时/过期文件 %d 个",
+            "下载中心已启动：上限 %d MB，缓存 %d 小时，百度网盘=%s，清理临时/过期文件 %d 个",
             self._cfg_int("max_file_size_mb", 300, min_val=1),
             self._cfg_int("cache_ttl_hours", 72, min_val=0),
+            "已启用" if bcfg.enabled else "未启用",
             stats.tmp_removed + stats.expired_removed + stats.missing_removed,
         )
         self._cleanup_task = asyncio.create_task(
@@ -122,13 +148,39 @@ class DownloadCenterPlugin(Star):
             self.store.close()
             self.store = None
 
-    def _cfg_bool(self, key: str, default: bool) -> bool:
-        val = self.config.get(key, default)
+    @staticmethod
+    def _to_bool(val: Any, default: bool) -> bool:
+        if val is None:
+            return default
         if isinstance(val, bool):
             return val
         if isinstance(val, str):
             return val.strip().lower() in {"1", "true", "yes", "on"}
         return bool(val)
+
+    @staticmethod
+    def _to_int(
+        val: Any,
+        default: int,
+        min_val: int | None = None,
+        max_val: int | None = None,
+    ) -> int:
+        try:
+            parsed = int(val)
+        except (TypeError, ValueError):
+            parsed = default
+        if min_val is not None:
+            parsed = max(min_val, parsed)
+        if max_val is not None:
+            parsed = min(max_val, parsed)
+        return parsed
+
+    @staticmethod
+    def _to_str(val: Any, default: str = "") -> str:
+        return str(val).strip() if val is not None else default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        return self._to_bool(self.config.get(key, default), default)
 
     def _cfg_int(
         self,
@@ -137,19 +189,32 @@ class DownloadCenterPlugin(Star):
         min_val: int | None = None,
         max_val: int | None = None,
     ) -> int:
-        try:
-            val = int(self.config.get(key, default))
-        except (TypeError, ValueError):
-            val = default
-        if min_val is not None:
-            val = max(min_val, val)
-        if max_val is not None:
-            val = min(max_val, val)
-        return val
+        return self._to_int(self.config.get(key, default), default, min_val=min_val, max_val=max_val)
 
     def _cfg_str(self, key: str, default: str = "") -> str:
-        val = self.config.get(key, default)
-        return str(val).strip() if val is not None else default
+        return self._to_str(self.config.get(key, default), default)
+
+    def _build_baidu_config(self) -> BaiduConfig:
+        raw = self.config.get("baidu_pan")
+        section = raw if isinstance(raw, dict) or hasattr(raw, "get") else {}
+        return BaiduConfig(
+            enabled=self._to_bool(section.get("enabled", False), False),
+            cookie=self._to_str(section.get("cookie", ""), ""),
+            openlist_url=self._to_str(section.get("openlist_url", "http://192.168.10.2:5244"), "http://192.168.10.2:5244"),
+            openlist_token=self._to_str(section.get("openlist_token", ""), ""),
+            openlist_mount_path=self._to_str(section.get("openlist_mount_path", "/baidu"), "/baidu") or "/baidu",
+            temp_dir=self._to_str(section.get("temp_dir", "/bot_tmp"), "/bot_tmp") or "/bot_tmp",
+            connections=self._to_int(section.get("connections", 3), 3, min_val=1, max_val=8),
+            chunk_size_bytes=self._to_int(section.get("chunk_size_mb", 8), 8, min_val=1, max_val=32) * 1024 * 1024,
+            max_pick_files=self._to_int(section.get("max_pick_files", 3), 3, min_val=1, max_val=20),
+            max_list_files=self._to_int(section.get("max_list_files", 50), 50, min_val=1, max_val=200),
+            max_downloads_per_day=self._to_int(section.get("max_downloads_per_day", 30), 30, min_val=0),
+        )
+
+    def _get_openlist_client(self, bcfg: BaiduConfig) -> OpenListClient:
+        if self._injected_openlist_client is not None:
+            return self._injected_openlist_client
+        return OpenListClient(bcfg.openlist_url, bcfg.openlist_token)
 
     def _build_options(self) -> DownloadOptions:
         allowed_raw = self._cfg_str("allowed_private_hosts", "")
@@ -187,6 +252,7 @@ class DownloadCenterPlugin(Star):
             try:
                 async with self._lock:
                     active_keys = set(self._inflight.keys())
+                    active_job_ids = set(self._jobs_by_id.keys())
                 max_total_bytes = self._cfg_int("cache_max_total_mb", 2048, min_val=0) * 1024 * 1024
                 stats = self.store.cleanup(
                     max_total_bytes=max_total_bytes,
@@ -200,10 +266,25 @@ class DownloadCenterPlugin(Star):
                         stats.tmp_removed,
                         format_bytes(stats.freed_bytes),
                     )
+                bcfg = self._build_baidu_config()
+                if bcfg.enabled and bcfg.openlist_url and bcfg.openlist_token:
+                    await self._cleanup_remote_baidu_temp(bcfg, active_job_ids)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.logger.warning("下载缓存定时清理失败：%s", exc)
+
+    async def _cleanup_remote_baidu_temp(
+        self,
+        bcfg: BaiduConfig,
+        active_job_ids: set[str],
+    ) -> None:
+        ol = self._get_openlist_client(bcfg)
+        mount_temp_root = join_openlist_path(bcfg.openlist_mount_path, bcfg.temp_dir)
+        async with create_http_session(self._build_options()) as session:
+            removed = await ol.cleanup_stale_temp_dirs(session, mount_temp_root, active_job_ids)
+            if removed:
+                self.logger.info("清理百度网盘过期临时目录 %d 个", removed)
 
     def _track_task(self, task: asyncio.Task[None]) -> None:
         self._background_tasks.add(task)
@@ -227,6 +308,7 @@ class DownloadCenterPlugin(Star):
         url: str,
         custom_filename: str = "",
         force: bool = False,
+        password: str = "",
     ) -> str:
         """Validate, deduplicate, and schedule a background download + upload."""
         if not self._cfg_bool("enabled", True):
@@ -236,10 +318,20 @@ class DownloadCenterPlugin(Star):
         if self._is_session_blocked(umo):
             return "当前会话已被管理员禁用下载功能。"
 
-        store = await self._ensure_initialized()
-        options = self._build_options()
         clean_url = url.strip()
         clean_name = custom_filename.strip()
+
+        if is_baidu_pan_url(clean_url):
+            return await self._submit_baidu_share(
+                umo=umo,
+                text_or_url=clean_url,
+                password=password,
+                custom_filename=clean_name,
+                force=force,
+            )
+
+        store = await self._ensure_initialized()
+        options = self._build_options()
 
         await validate_url_and_ssrf(clean_url, options)
         orig_key = url_key(clean_url)
@@ -310,6 +402,365 @@ class DownloadCenterPlugin(Star):
             f"{mode_hint}，任务 {job.job_id}），完成后会自动上传。"
             f"查进度：/dl list，取消：/dl cancel {job.job_id}"
         )
+
+    def _validate_baidu_ready(self, bcfg: BaiduConfig) -> str | None:
+        if not bcfg.enabled:
+            return "百度网盘下载尚未开启，请在 AstrBot 插件设置页「下载中心 -> 百度网盘设置」中启用并配置。"
+        missing: list[str] = []
+        if not bcfg.cookie:
+            missing.append("百度网盘 Cookie")
+        if not bcfg.openlist_url:
+            missing.append("OpenList 地址")
+        if not bcfg.openlist_token:
+            missing.append("OpenList 令牌")
+        if missing:
+            return f"百度网盘配置不完整（缺少：{'、'.join(missing)}），请在插件设置页补充后再试。"
+        return None
+
+    async def _submit_baidu_share(
+        self,
+        umo: str,
+        text_or_url: str,
+        password: str = "",
+        custom_filename: str = "",
+        force: bool = False,
+    ) -> str:
+        bcfg = self._build_baidu_config()
+        err_msg = self._validate_baidu_ready(bcfg)
+        if err_msg:
+            return err_msg
+
+        info = extract_baidu_share_info(text_or_url, explicit_pwd=password)
+        if info is None:
+            return "未识别到有效的百度网盘分享链接。"
+        full_surl, short_surl, pwd = info
+
+        await self._ensure_initialized()
+        options = self._build_options()
+        bd_client = BaiduPanClient(
+            bcfg.cookie,
+            api_base=self._baidu_api_base,
+            user_agent=options.user_agent,
+            proxy=options.proxy,
+        )
+
+        async with create_http_session(options) as session:
+            randsk = (
+                await bd_client.verify_pwd(session, full_surl, short_surl, pwd)
+                if pwd
+                else ""
+            )
+            meta = await bd_client.fetch_share_metadata(
+                session,
+                full_surl,
+                short_surl,
+                randsk=randsk,
+            )
+            files, truncated = await bd_client.list_share_files(
+                session,
+                full_surl,
+                short_surl,
+                randsk=randsk,
+                max_files=bcfg.max_list_files,
+            )
+
+        if not files:
+            return "该百度网盘分享中没有可下载的文件（可能仅包含空文件夹）。"
+
+        if len(files) == 1 and not truncated:
+            return await self._schedule_baidu_file(
+                umo=umo,
+                meta=meta,
+                share_file=files[0],
+                bcfg=bcfg,
+                options=options,
+                custom_filename=custom_filename,
+                force=force,
+            )
+
+        share_session = self._share_sessions.put(umo, meta, files, truncated=truncated)
+        lines = [
+            f"百度网盘分享包含多个文件（清单编号 {share_session.code}，30 分钟内有效）：",
+        ]
+        for item in files:
+            limit_tag = " ❌超限" if item.size > options.max_bytes else ""
+            lines.append(f"{item.index}. {item.rel_path} ({format_bytes(item.size)}){limit_tag}")
+        if truncated:
+            lines.append(f"（目录文件较多，仅展示前 {len(files)} 个）")
+        lines.append(
+            f"可发送「下第 X 个」或 /dl pick {share_session.code} <编号>（单次最多 {bcfg.max_pick_files} 个，单文件上限 {format_bytes(options.max_bytes)}）"
+        )
+        return "\n".join(lines)
+
+    async def pick_baidu_files(
+        self,
+        umo: str,
+        indices_spec: str,
+        share_code: str = "",
+        force: bool = False,
+    ) -> str:
+        """Select and start downloading one or more files from a listed Baidu share."""
+        if not self._cfg_bool("enabled", True):
+            return "下载中心插件当前已在配置中关闭。"
+        if not umo:
+            return "无法识别当前会话。"
+        if self._is_session_blocked(umo):
+            return "当前会话已被管理员禁用下载功能。"
+
+        bcfg = self._build_baidu_config()
+        err_msg = self._validate_baidu_ready(bcfg)
+        if err_msg:
+            return err_msg
+
+        share_session = self._share_sessions.get(umo, share_code=share_code)
+        if share_session is None:
+            hint = f"（编号 {share_code}）" if share_code else ""
+            return f"未找到有效的百度分享清单{hint}（清单 30 分钟过期），请重新发送百度网盘链接。"
+
+        indices = parse_pick_indices(
+            indices_spec,
+            max_index=len(share_session.files),
+            max_pick=bcfg.max_pick_files,
+        )
+        meta = BaiduShareMetadata(
+            full_surl=share_session.full_surl,
+            short_surl=share_session.short_surl,
+            shareid=share_session.shareid,
+            uk=share_session.uk,
+            bdstoken=share_session.bdstoken,
+            randsk=share_session.randsk,
+        )
+        options = self._build_options()
+        replies: list[str] = []
+        for idx in indices:
+            share_file = share_session.get_file(idx)
+            if share_file is None:
+                replies.append(f"#{idx} 不存在。")
+                continue
+            try:
+                msg = await self._schedule_baidu_file(
+                    umo=umo,
+                    meta=meta,
+                    share_file=share_file,
+                    bcfg=bcfg,
+                    options=options,
+                    force=force,
+                )
+            except DownloadError as exc:
+                msg = f"#{idx}「{share_file.filename}」：{exc}"
+            replies.append(msg)
+        return "\n".join(replies)
+
+    def _reserve_baidu_quota_locked(self, bcfg: BaiduConfig) -> None:
+        if bcfg.max_downloads_per_day <= 0:
+            return
+        today = time.strftime("%Y-%m-%d")
+        if self._baidu_daily_date != today:
+            self._baidu_daily_date = today
+            self._baidu_daily_count = 0
+        if self._baidu_daily_count >= bcfg.max_downloads_per_day:
+            raise BaiduPanError(
+                f"今日百度网盘解析下载次数已达上限（{bcfg.max_downloads_per_day} 次），请明天再试。"
+            )
+        self._baidu_daily_count += 1
+
+    async def _schedule_baidu_file(
+        self,
+        umo: str,
+        meta: BaiduShareMetadata,
+        share_file: BaiduShareFile,
+        bcfg: BaiduConfig,
+        options: DownloadOptions,
+        custom_filename: str = "",
+        force: bool = False,
+    ) -> str:
+        store = await self._ensure_initialized()
+        send_name = sanitize_filename(custom_filename) if custom_filename else sanitize_filename(share_file.filename)
+        if share_file.size > options.max_bytes:
+            raise BaiduPanError(
+                f"「{send_name}」大小为 {format_bytes(share_file.size)}，超过上限 {format_bytes(options.max_bytes)}。"
+            )
+
+        ckey = canonical_baidu_key(meta.full_surl, share_file.fs_id)
+        ckey_hash = canonical_key_hash(ckey)
+
+        async with self._lock:
+            existing_job = self._inflight.get(ckey_hash)
+            if existing_job is not None:
+                if umo not in existing_job.waiters:
+                    existing_job.waiters[umo] = custom_filename
+                return self._format_inflight_reply(existing_job)
+
+            if not force:
+                cached = store.lookup("", canonical_key=ckey)
+                if cached is not None:
+                    return self._schedule_cached_upload(umo, cached, custom_filename)
+
+            self._reserve_baidu_quota_locked(bcfg)
+
+            job_id = uuid.uuid4().hex[:8]
+            job = DownloadJob(
+                job_id=job_id,
+                url=ckey,
+                url_key=ckey_hash,
+                final_url_key=ckey_hash,
+                filename=send_name,
+                total_size=share_file.size,
+                waiters={umo: custom_filename},
+            )
+            self._inflight[ckey_hash] = job
+            self._jobs_by_id[job_id] = job
+            job.task = asyncio.create_task(
+                self._run_baidu_download_job(job, meta, share_file, bcfg, options),
+                name=f"baidu_download_job_{job_id}",
+            )
+            self._track_task(job.task)
+
+        return (
+            f"已开始后台下载百度网盘「{send_name}」（{format_bytes(share_file.size)}，"
+            f"{bcfg.connections} 并发分片，任务 {job.job_id}），完成后会自动上传。"
+            f"查进度：/dl list，取消：/dl cancel {job.job_id}"
+        )
+
+    async def _run_baidu_download_job(
+        self,
+        job: DownloadJob,
+        meta: BaiduShareMetadata,
+        share_file: BaiduShareFile,
+        bcfg: BaiduConfig,
+        options: DownloadOptions,
+    ) -> None:
+        assert self.store is not None
+        assert self._semaphore is not None
+        ttl_hours = self._cfg_int("cache_ttl_hours", 72, min_val=0)
+        entry: CacheEntry | None = None
+        ol = self._get_openlist_client(bcfg)
+        temp_root_baidu = "/" + bcfg.temp_dir.strip("/")
+        job_baidu_dir = f"{temp_root_baidu}/{job.job_id}"
+        mount_temp_root = join_openlist_path(bcfg.openlist_mount_path, bcfg.temp_dir)
+        job_openlist_dir = join_openlist_path(mount_temp_root, job.job_id)
+        remote_created = False
+
+        try:
+            async with self._semaphore:
+                if job.cancel_event.is_set():
+                    raise DownloadCancelledError("下载任务已取消。")
+
+                job.status = "transferring"
+                bd_client = BaiduPanClient(
+                    bcfg.cookie,
+                    api_base=self._baidu_api_base,
+                    user_agent=options.user_agent,
+                    proxy=options.proxy,
+                )
+                async with create_http_session(options) as api_session:
+                    await ol.mkdir(api_session, job_openlist_dir)
+                    remote_created = True
+                    await bd_client.transfer_file(
+                        api_session,
+                        meta,
+                        share_file.fs_id,
+                        job_baidu_dir,
+                    )
+
+                    target_file_name = ""
+                    for attempt in range(3):
+                        items = await ol.list_dir(api_session, job_openlist_dir, refresh=True)
+                        non_dirs = [it for it in items if not it.is_dir and it.name]
+                        if non_dirs:
+                            exact = next((it for it in non_dirs if it.name == share_file.filename), None)
+                            target_file_name = (exact or non_dirs[0]).name
+                            break
+                        if attempt < 2:
+                            await asyncio.sleep(1.0)
+
+                    if not target_file_name:
+                        raise OpenListError("转存后在 OpenList 临时目录未找到文件，请检查 OpenList 百度挂载配置。")
+
+                    finfo = await ol.get_file(
+                        api_session,
+                        join_openlist_path(job_openlist_dir, target_file_name),
+                    )
+
+                job.status = "downloading"
+                bd_options = DownloadOptions(
+                    max_bytes=options.max_bytes,
+                    connections=bcfg.connections,
+                    chunk_size_bytes=bcfg.chunk_size_bytes,
+                    timeout_sec=options.timeout_sec,
+                    retry_count=options.retry_count,
+                    block_html_pages=options.block_html_pages,
+                    block_private_network=options.block_private_network,
+                    allowed_private_hosts=options.allowed_private_hosts,
+                    proxy=options.proxy,
+                    user_agent=options.user_agent,
+                    extra_headers=finfo.headers,
+                )
+
+                def _on_progress(done: int, total: int | None) -> None:
+                    job.downloaded_bytes = done
+                    if total is not None:
+                        job.total_size = total
+
+                result = await download(
+                    url=finfo.raw_url,
+                    url_key=job.url_key,
+                    tmp_dir=self.store.tmp_dir,
+                    options=bd_options,
+                    custom_filename=share_file.filename,
+                    progress_cb=_on_progress,
+                    cancel_event=job.cancel_event,
+                    resume_key=job.url,
+                )
+
+            job.status = "uploading"
+            entry = self.store.store_downloaded(
+                original_url=job.url,
+                result=result,
+                ttl_hours=ttl_hours,
+                custom_filename=share_file.filename,
+                canonical_key=job.url,
+            )
+            self.store.pin(entry.sha256)
+
+            async with self._lock:
+                waiters = {
+                    umo: (sanitize_filename(name) if name else entry.filename)
+                    for umo, name in job.waiters.items()
+                }
+                self._remove_job_locked(job)
+
+            await self._upload_entry_to_waiters(entry, waiters)
+            entry = None
+        except asyncio.CancelledError:
+            async with self._lock:
+                waiters_umo = list(job.waiters.keys())
+                self._remove_job_locked(job)
+            for umo in waiters_umo:
+                await self._send_text(umo, f"任务 {job.job_id}（{job.filename}）已取消。")
+            raise
+        except DownloadError as exc:
+            async with self._lock:
+                waiters_umo = list(job.waiters.keys())
+                self._remove_job_locked(job)
+            for umo in waiters_umo:
+                await self._send_text(umo, f"下载百度网盘「{job.filename}」失败：{exc}")
+        except Exception as exc:
+            self.logger.exception("百度网盘任务 %s 发生未预期错误：%s", job.job_id, exc)
+            async with self._lock:
+                waiters_umo = list(job.waiters.keys())
+                self._remove_job_locked(job)
+            for umo in waiters_umo:
+                await self._send_text(umo, f"下载百度网盘「{job.filename}」出错：{exc}")
+        finally:
+            if remote_created:
+                with suppress(Exception):
+                    async with create_http_session(options) as clean_session:
+                        await ol.remove(clean_session, mount_temp_root, [job.job_id])
+            if entry is not None:
+                self.store.unpin(entry.sha256)
+            async with self._lock:
+                self._remove_job_locked(job)
 
     @staticmethod
     def _format_inflight_reply(job: DownloadJob) -> str:
@@ -388,7 +839,7 @@ class DownloadCenterPlugin(Star):
                 self._remove_job_locked(job)
 
             await self._upload_entry_to_waiters(entry, waiters)
-            entry = None  # unpinned inside _upload_entry_to_waiters
+            entry = None
         except asyncio.CancelledError:
             async with self._lock:
                 waiters_umo = list(job.waiters.keys())
@@ -456,13 +907,15 @@ class DownloadCenterPlugin(Star):
         url: str,
         filename: str = "",
         force: bool = False,
+        password: str = "",
     ) -> str:
-        """当用户明确请求帮忙下载某个文件直链/安装包/压缩包/文档并发送到当前聊天时调用。禁止用于 B站、抖音、小红书、微博、YouTube 等社交媒体的视频或图文链接。
+        """当用户明确请求帮忙下载文件直链或百度网盘分享链接（pan.baidu.com/s/...）并发送到当前聊天时调用。禁止用于 B站、抖音、小红书、微博、YouTube 等社交媒体的视频或图文链接。
 
         Args:
-            url(string): 要下载的文件直链（必须是 http 或 https 链接）
+            url(string): 要下载的文件直链或百度网盘分享链接（必须是 http 或 https 链接）
             filename(string): 可选自定义保存文件名，留空则自动识别
             force(boolean): 是否忽略本地缓存强制重新下载，默认 false
+            password(string): 百度网盘 4 位提取码（若链接或文本中带提取码可一并传入）
         """
         umo = getattr(event, "unified_msg_origin", "")
         try:
@@ -471,6 +924,7 @@ class DownloadCenterPlugin(Star):
                 url=url,
                 custom_filename=filename,
                 force=force,
+                password=password,
             )
         except DownloadError as exc:
             return f"无法开始下载：{exc}"
@@ -478,9 +932,38 @@ class DownloadCenterPlugin(Star):
             self.logger.exception("download_and_send_file 工具执行异常：%s", exc)
             return f"触发下载失败：{exc}"
 
+    @filter.llm_tool(name="pick_baidu_share_files")
+    async def tool_pick_baidu_share_files(
+        self,
+        event: AstrMessageEvent,
+        indices: str,
+        share_code: str = "",
+        force: bool = False,
+    ) -> str:
+        """当此前列出了百度网盘多文件清单，用户回复要下载第几个文件时调用。
+
+        Args:
+            indices(string): 要下载的文件编号，例如 '2'、'1 3'、'1,2' 或 '1-3'
+            share_code(string): 可选 4 位清单编号，留空则自动匹配当前会话最近一次百度网盘清单
+            force(boolean): 是否忽略本地缓存强制重新下载，默认 false
+        """
+        umo = getattr(event, "unified_msg_origin", "")
+        try:
+            return await self.pick_baidu_files(
+                umo=umo,
+                indices_spec=indices,
+                share_code=share_code,
+                force=force,
+            )
+        except DownloadError as exc:
+            return f"选号下载失败：{exc}"
+        except Exception as exc:
+            self.logger.exception("pick_baidu_share_files 工具执行异常：%s", exc)
+            return f"选号下载失败：{exc}"
+
     @filter.command("dl", alias={"下载"})
     async def dl_command(self, event: AstrMessageEvent):
-        """下载中心命令入口：/dl <url> | force <url> | list | cancel <id> | clean | help"""
+        """下载中心命令入口：/dl <url> | force <url> | pick [短码] <编号> | list | cancel <id> | clean | help"""
         raw = event.get_message_str().strip()
         rest = re.sub(r"^/?(?:dl|下载)\b\s*", "", raw, flags=re.IGNORECASE).strip()
 
@@ -500,6 +983,27 @@ class DownloadCenterPlugin(Star):
                 yield event.plain_result("用法：/dl cancel <任务ID>")
                 return
             yield event.plain_result(await self._cancel_job(tokens[1]))
+            return
+
+        if sub == "pick":
+            if len(tokens) < 2:
+                yield event.plain_result("用法：/dl pick [清单编号] <文件编号...>，例如 /dl pick 2")
+                return
+            umo = getattr(event, "unified_msg_origin", "")
+            pick_args = tokens[1:]
+            share_code = ""
+            if len(pick_args) >= 2 and self._share_sessions.get(umo, share_code=pick_args[0]) is not None:
+                share_code = pick_args[0]
+                pick_args = pick_args[1:]
+            try:
+                reply = await self.pick_baidu_files(
+                    umo=umo,
+                    indices_spec=" ".join(pick_args),
+                    share_code=share_code,
+                )
+            except DownloadError as exc:
+                reply = f"选号下载失败：{exc}"
+            yield event.plain_result(reply)
             return
 
         if sub == "clean":
@@ -527,9 +1031,32 @@ class DownloadCenterPlugin(Star):
         if sub == "force":
             force = True
             tokens = tokens[1:]
+            rest = " ".join(tokens)
 
         if not tokens:
-            yield event.plain_result("用法：/dl [force] <url> [文件名]")
+            yield event.plain_result("用法：/dl [force] <url> [文件名/提取码]")
+            return
+
+        umo = getattr(event, "unified_msg_origin", "")
+        if is_baidu_pan_url(rest):
+            explicit_pwd = ""
+            parsed_info = extract_baidu_share_info(rest)
+            if parsed_info and not parsed_info[2]:
+                for tok in tokens:
+                    cleaned_tok = tok.strip()
+                    if not is_baidu_pan_url(cleaned_tok) and _PLAIN_PWD_RE.fullmatch(cleaned_tok):
+                        explicit_pwd = cleaned_tok
+                        break
+            try:
+                reply = await self.submit_download(
+                    umo=umo,
+                    url=rest,
+                    force=force,
+                    password=explicit_pwd,
+                )
+            except DownloadError as exc:
+                reply = f"无法开始下载：{exc}"
+            yield event.plain_result(reply)
             return
 
         candidate_url = tokens[0]
@@ -543,7 +1070,6 @@ class DownloadCenterPlugin(Star):
         else:
             custom_name = " ".join(tokens[1:]).strip()
 
-        umo = getattr(event, "unified_msg_origin", "")
         try:
             reply = await self.submit_download(
                 umo=umo,
@@ -592,9 +1118,10 @@ class DownloadCenterPlugin(Star):
         max_mb = self._cfg_int("max_file_size_mb", 300, min_val=1)
         ttl = self._cfg_int("cache_ttl_hours", 72, min_val=0)
         return (
-            "下载中心用法（也可直接聊天让 AI 帮忙下载直链）：\n"
-            "/dl <链接> [自定义文件名] - 下载并上传到当前会话\n"
+            "下载中心用法（也可直接聊天让 AI 帮忙下载直链或百度网盘分享）：\n"
+            "/dl <链接> [自定义文件名/提取码] - 下载并上传到当前会话\n"
             "/dl force <链接> [文件名] - 忽略缓存强制重下\n"
+            "/dl pick [清单编号] <文件编号...> - 从百度网盘多文件清单选号下载\n"
             "/dl list - 查看进行中任务与缓存空间\n"
             "/dl cancel <任务ID> - 取消指定下载任务\n"
             "/dl clean - 清理过期缓存与残留临时文件\n"
