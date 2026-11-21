@@ -1,0 +1,8 @@
+name: astrbot_plugin_download_center
+display_name: 下载中心
+short_desc: 聊天识别下载需求，分片断点续传下载并上传到群/私聊，带去重缓存与大小限制。
+desc: 通过 LLM 工具或 /dl 指令触发文件下载并自动上传至当前会话。支持 aiohttp 多连接动态分片、断点续传、分片级失败重试、并发与缓存三层去重、可调大小上限、TTL/LRU 缓存自动清理，以及共享卷直传与 NapCat 分片上传。
+version: "1.0.0"
+author: bpking1
+repo: https://github.com/bpking1/astrbot_plugin_download_center
+astrbot_version: ">=4.9.2,<5"

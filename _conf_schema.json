@@ -1,0 +1,109 @@
+{
+  "enabled": {
+    "description": "启用下载中心插件",
+    "type": "bool",
+    "default": true
+  },
+  "max_file_size_mb": {
+    "description": "单文件大小上限（MB）",
+    "hint": "下载前与下载中都会校验；超过该大小立即拦截并删除临时文件。默认 300 MB。",
+    "type": "int",
+    "default": 300
+  },
+  "cache_ttl_hours": {
+    "description": "缓存保留时间（小时）",
+    "hint": "有效期内同一链接或同内容文件直接复用上传，不重复下载。设为 0 表示上传完成后立即删除本地缓存。",
+    "type": "int",
+    "default": 72
+  },
+  "cache_max_total_mb": {
+    "description": "缓存目录总容量上限（MB）",
+    "hint": "超出后按最近最少使用（LRU）自动淘汰未在传输中的缓存文件。",
+    "type": "int",
+    "default": 2048
+  },
+  "cleanup_interval_minutes": {
+    "description": "定时清理缓存间隔（分钟）",
+    "type": "int",
+    "default": 30
+  },
+  "max_concurrent_downloads": {
+    "description": "全局最大同时下载任务数",
+    "type": "int",
+    "default": 2
+  },
+  "connections_per_download": {
+    "description": "单任务多协程并发分片数",
+    "hint": "服务端支持 Range 时按分片并发下载（建议 4~8），不支持时自动降级单流。",
+    "type": "int",
+    "default": 6
+  },
+  "chunk_size_mb": {
+    "description": "分片大小（MB）",
+    "hint": "动态分片池每个分片的大小，同时也是触发分片并发的最小文件体积。",
+    "type": "int",
+    "default": 4
+  },
+  "download_timeout_sec": {
+    "description": "单任务总下载超时（秒）",
+    "type": "int",
+    "default": 600
+  },
+  "retry_count": {
+    "description": "分片 / 瞬断失败重试次数",
+    "hint": "遇到断连、超时、5xx 或 429 时进行指数退避重试。",
+    "type": "int",
+    "default": 4
+  },
+  "upload_mode": {
+    "description": "QQ 文件上传方式",
+    "hint": "shared_path 适合 AstrBot 与 NapCat 共享 /AstrBot/data 卷直接发路径；napcat_stream 为跨机分片流式上传（参考 qq-float）。",
+    "type": "string",
+    "options": [
+      "shared_path",
+      "napcat_stream"
+    ],
+    "default": "shared_path"
+  },
+  "revalidate_cache_with_head": {
+    "description": "命中缓存时先用 HEAD 检查远端是否更新",
+    "hint": "开启后每次命中缓存都会发一次轻量 HEAD 请求比对 ETag / Last-Modified；关闭则直接使用本地未过期缓存（可用 /dl force 强制重下）。",
+    "type": "bool",
+    "default": false
+  },
+  "block_html_pages": {
+    "description": "拦截返回 HTML 网页的链接",
+    "hint": "防止误把需要登录的网页或错误页当文件传到群里。",
+    "type": "bool",
+    "default": true
+  },
+  "block_private_network": {
+    "description": "禁止下载内网 / 本机地址（SSRF 防护）",
+    "hint": "默认开启，重定向跳转每一跳也会校验。",
+    "type": "bool",
+    "default": true
+  },
+  "allowed_private_hosts": {
+    "description": "允许访问的内网主机白名单（逗号分隔）",
+    "hint": "仅当你需要下载局域网自建服务文件时填写，例如 192.168.10.2,nas.local。",
+    "type": "string",
+    "default": ""
+  },
+  "blocked_sessions": {
+    "description": "禁用下载功能的会话 UMO（逗号分隔）",
+    "hint": "默认留空表示群聊和私聊所有人均可使用；如需屏蔽特定群可填其 UMO。",
+    "type": "string",
+    "default": ""
+  },
+  "proxy": {
+    "description": "HTTP 代理地址（可选，默认留空走系统透明代理）",
+    "hint": "如 http://192.168.10.2:7890；有透明代理时保持为空即可。",
+    "type": "string",
+    "default": ""
+  },
+  "user_agent": {
+    "description": "自定义请求 User-Agent",
+    "type": "string",
+    "default": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+  }
+}

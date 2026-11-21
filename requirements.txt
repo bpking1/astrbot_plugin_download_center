@@ -1,0 +1,1 @@
+# Core dependencies (aiohttp, etc.) are already bundled in AstrBot.
