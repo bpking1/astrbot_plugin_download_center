@@ -135,6 +135,90 @@ class UploaderAndPluginTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await runner.cleanup()
 
+    async def test_apk_auto_rename_on_upload(self) -> None:
+        class _InspectingContext(_FakeContext):
+            def __init__(self, bot: _FakeBot | None = None) -> None:
+                super().__init__(bot)
+                self.observed: list[tuple[str, str, bytes]] = []
+
+            async def send_message(self, session: str, message_chain) -> bool:
+                for comp in message_chain.chain:
+                    if isinstance(comp, File):
+                        fpath = Path(comp.file_)
+                        self.observed.append((comp.name, str(fpath), fpath.read_bytes()))
+                return await super().send_message(session, message_chain)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            apk_path = root / "deadbeef.apk"
+            tmp_dir = root / "tmp"
+            payload = b"APK-PAYLOAD-" * 1024
+            apk_path.write_bytes(payload)
+
+            ctx_on = _InspectingContext()
+            sent_name = await upload_file_to_session(
+                ctx_on,
+                "ai小猪:GroupMessage:530698338",
+                apk_path,
+                "app-1.0+2.apk",
+                upload_mode="shared_path",
+                rename_apk=True,
+                tmp_dir=tmp_dir,
+            )
+            self.assertEqual(sent_name, "app-1.0+2.apk.1")
+            self.assertEqual(len(ctx_on.observed), 1)
+            obs_name, obs_path, obs_bytes = ctx_on.observed[0]
+            self.assertEqual(obs_name, "app-1.0+2.apk.1")
+            self.assertTrue(obs_path.endswith(".apk.1"))
+            self.assertEqual(obs_bytes, payload)
+            self.assertEqual(list(tmp_dir.glob("send_*")), [])
+            self.assertTrue(apk_path.exists())
+
+            ctx_off = _InspectingContext()
+            sent_plain = await upload_file_to_session(
+                ctx_off,
+                "ai小猪:GroupMessage:530698338",
+                apk_path,
+                "app-1.0+2.apk",
+                upload_mode="shared_path",
+                rename_apk=False,
+                tmp_dir=tmp_dir,
+            )
+            self.assertEqual(sent_plain, "app-1.0+2.apk")
+            self.assertEqual(ctx_off.observed[0][0], "app-1.0+2.apk")
+            self.assertEqual(ctx_off.observed[0][1], str(apk_path))
+
+            ctx_stream = _InspectingContext()
+            sent_stream = await upload_file_to_session(
+                ctx_stream,
+                "ai小猪:GroupMessage:530698338",
+                apk_path,
+                "app-1.0+2.apk",
+                upload_mode="napcat_stream",
+                rename_apk=True,
+                tmp_dir=tmp_dir,
+            )
+            self.assertEqual(sent_stream, "app-1.0+2.apk.1")
+            stream_calls = ctx_stream.bot.calls
+            self.assertEqual(stream_calls[0][1]["filename"], "app-1.0+2.apk.1")
+            self.assertEqual(stream_calls[-1][1]["message"][0]["data"]["name"], "app-1.0+2.apk.1")
+
+            ctx_zip = _InspectingContext()
+            zip_path = root / "demo.zip"
+            zip_path.write_bytes(b"PK-ZIP")
+            sent_zip = await upload_file_to_session(
+                ctx_zip,
+                "ai小猪:GroupMessage:530698338",
+                zip_path,
+                "demo.zip",
+                upload_mode="shared_path",
+                rename_apk=True,
+                tmp_dir=tmp_dir,
+            )
+            self.assertEqual(sent_zip, "demo.zip")
+            self.assertEqual(ctx_zip.observed[0][0], "demo.zip")
+            self.assertEqual(ctx_zip.observed[0][1], str(zip_path))
+
     async def test_shared_path_and_napcat_stream_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sample = Path(tmp) / "demo.bin"

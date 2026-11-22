@@ -463,6 +463,13 @@ class CacheStore:
                         removed += 1
                 except OSError:
                     pass
+            elif name.startswith("send_"):
+                try:
+                    if now - p.stat().st_ctime > 1800:
+                        p.unlink()
+                        removed += 1
+                except OSError:
+                    pass
 
         for key in part_keys ^ meta_keys:
             if key in active_keys:

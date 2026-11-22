@@ -65,6 +65,12 @@
     ],
     "default": "shared_path"
   },
+  "rename_apk_on_upload": {
+    "description": "上传 APK 时自动改名为 .apk.1",
+    "hint": "开启后在上传 .apk 文件时自动追加 .1 后缀（如 app.apk.1），规避 QQ/NTQQ 拦截安装包；下载后去掉 .1 即可安装。",
+    "type": "bool",
+    "default": true
+  },
   "revalidate_cache_with_head": {
     "description": "命中缓存时先用 HEAD 检查远端是否更新",
     "hint": "开启后每次命中缓存都会发一次轻量 HEAD 请求比对 ETag / Last-Modified；关闭则直接使用本地未过期缓存（可用 /dl force 强制重下）。",

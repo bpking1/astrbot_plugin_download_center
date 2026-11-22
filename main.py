@@ -44,7 +44,7 @@ from .downloader import (
     validate_url_and_ssrf,
 )
 from .openlist_client import OpenListClient, OpenListError, join_openlist_path
-from .uploader import UploadError, upload_file_to_session
+from .uploader import UploadError, normalize_upload_filename, upload_file_to_session
 
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _PLAIN_PWD_RE = re.compile(r"^[A-Za-z0-9]{4}$")
@@ -324,6 +324,17 @@ class DownloadCenterPlugin(Star):
                 gate.set()
         return msg
 
+    def _apk_rename_hint(self, filename: str) -> str:
+        _, will_rename = normalize_upload_filename(
+            filename,
+            rename_apk=self._cfg_bool("rename_apk_on_upload", True),
+        )
+        return (
+            "（APK 将自动改名为 .apk.1 上传以防 QQ 拦截，下载后去掉 .1 即可安装）"
+            if will_rename
+            else ""
+        )
+
     async def _ensure_initialized(self) -> CacheStore:
         if self.store is None or self._semaphore is None:
             await self.initialize()
@@ -447,7 +458,7 @@ class DownloadCenterPlugin(Star):
                 )
                 reply = (
                     f"已开始后台下载「{probe_res.filename}」（{format_bytes(probe_res.total_size)}，"
-                    f"{mode_hint}，任务 {job.job_id}），完成后会自动上传。"
+                    f"{mode_hint}，任务 {job.job_id}），完成后会自动上传{self._apk_rename_hint(probe_res.filename)}。"
                     f"查进度：/dl list，取消：/dl cancel {job.job_id}"
                 )
 
@@ -703,7 +714,7 @@ class DownloadCenterPlugin(Star):
 
         return (
             f"已开始后台下载百度网盘「{send_name}」（{format_bytes(share_file.size)}，"
-            f"{bcfg.connections} 并发分片，任务 {job.job_id}），完成后会自动上传。"
+            f"{bcfg.connections} 并发分片，任务 {job.job_id}），完成后会自动上传{self._apk_rename_hint(send_name)}。"
             f"查进度：/dl list，取消：/dl cancel {job.job_id}"
         )
 
@@ -883,7 +894,10 @@ class DownloadCenterPlugin(Star):
             name=f"upload_cached_{entry.sha256[:8]}",
         )
         self._track_task(task)
-        return f"命中本地缓存「{send_name}」（{format_bytes(entry.file_size)}），正在直接上传，无需重复下载。"
+        return (
+            f"命中本地缓存「{send_name}」（{format_bytes(entry.file_size)}），"
+            f"正在直接上传，无需重复下载{self._apk_rename_hint(send_name)}。"
+        )
 
     async def _run_download_job(
         self,
@@ -978,6 +992,7 @@ class DownloadCenterPlugin(Star):
     ) -> None:
         assert self.store is not None
         upload_mode = self._cfg_str("upload_mode", "shared_path")
+        rename_apk = self._cfg_bool("rename_apk_on_upload", True)
         try:
             if start_gate is not None:
                 await start_gate.wait()
@@ -989,6 +1004,8 @@ class DownloadCenterPlugin(Star):
                         file_path=entry.file_path,
                         filename=send_name,
                         upload_mode=upload_mode,
+                        rename_apk=rename_apk,
+                        tmp_dir=self.store.tmp_dir,
                     )
                 except (UploadError, Exception) as exc:
                     self.logger.warning("上传文件到 %s 失败：%s", umo, exc)

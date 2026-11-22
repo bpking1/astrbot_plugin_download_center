@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from contextlib import suppress
 import math
 import os
 from pathlib import Path
+import shutil
 from typing import Any
 import uuid
 
@@ -21,6 +23,13 @@ STREAM_CHUNK_SIZE = 512 * 1024
 
 class UploadError(Exception):
     """Raised when uploading a downloaded file to a chat session fails."""
+
+
+def normalize_upload_filename(filename: str, *, rename_apk: bool = True) -> tuple[str, bool]:
+    """Rename .apk to .apk.1 when enabled to avoid QQ/NTQQ blocking APK uploads."""
+    if rename_apk and filename.lower().endswith(".apk"):
+        return f"{filename}.1", True
+    return filename, False
 
 
 def parse_umo(umo: str) -> tuple[str, bool, str]:
@@ -82,26 +91,53 @@ async def upload_via_napcat_stream(
         await bot.call_action("send_private_msg", user_id=numeric_id, message=segments)
 
 
+def _create_upload_alias(file_path: Path, alias_dir: Path) -> Path:
+    alias_dir.mkdir(parents=True, exist_ok=True)
+    temp_alias = alias_dir / f"send_{uuid.uuid4().hex[:8]}_{file_path.name}.1"
+    try:
+        os.link(file_path, temp_alias)
+    except OSError:
+        shutil.copyfile(file_path, temp_alias)
+    return temp_alias
+
+
 async def upload_file_to_session(
     context: Context,
     umo: str,
     file_path: Path,
     filename: str,
     upload_mode: str = "shared_path",
-) -> None:
+    rename_apk: bool = True,
+    tmp_dir: Path | None = None,
+) -> str:
     """Upload a local file to an AstrBot session using shared_path or napcat_stream."""
     if not file_path.exists():
         raise UploadError(f"待上传文件不存在：{file_path}")
+
+    send_name, was_renamed = normalize_upload_filename(filename, rename_apk=rename_apk)
 
     if upload_mode == "napcat_stream":
         platform_id, is_group, target_id = parse_umo(umo)
         adapter = context.get_platform_inst(platform_id)
         bot = adapter.get_client() if adapter is not None and hasattr(adapter, "get_client") else None
         if bot is not None and hasattr(bot, "call_action"):
-            await upload_via_napcat_stream(bot, is_group, target_id, file_path, filename)
-            return
+            await upload_via_napcat_stream(bot, is_group, target_id, file_path, send_name)
+            return send_name
 
-    chain = MessageChain([File(name=filename, file=str(file_path))])
-    sent = await context.send_message(umo, chain)
-    if sent is False:
-        raise UploadError(f"未找到目标会话对应的平台适配器：{umo}")
+    temp_alias: Path | None = None
+    send_path = file_path
+    try:
+        if was_renamed and file_path.name.lower().endswith(".apk"):
+            alias_dir = tmp_dir if tmp_dir is not None else file_path.parent
+            temp_alias = await asyncio.to_thread(_create_upload_alias, file_path, alias_dir)
+            send_path = temp_alias
+
+        chain = MessageChain([File(name=send_name, file=str(send_path))])
+        sent = await context.send_message(umo, chain)
+        if sent is False:
+            raise UploadError(f"未找到目标会话对应的平台适配器：{umo}")
+        return send_name
+    finally:
+        if temp_alias is not None:
+            with suppress(OSError):
+                temp_alias.unlink()
