@@ -260,7 +260,11 @@ class BaiduPanTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("查进度：/dl list", reply)
 
                     for _ in range(50):
-                        if len(ctx.sent) >= 1 and not plugin._jobs_by_id:
+                        if (
+                            len(ctx.sent) >= 1
+                            and not plugin._jobs_by_id
+                            and not plugin._background_tasks
+                        ):
                             break
                         await asyncio.sleep(0.05)
 
@@ -330,7 +334,11 @@ class BaiduPanTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn("超过上限", pick_reply)
 
                     for _ in range(50):
-                        if len(ctx.sent) >= 1 and not plugin._jobs_by_id:
+                        if (
+                            len(ctx.sent) >= 1
+                            and not plugin._jobs_by_id
+                            and not plugin._background_tasks
+                        ):
                             break
                         await asyncio.sleep(0.05)
                     self.assertEqual(len(ctx.sent), 1)
@@ -341,7 +349,11 @@ class BaiduPanTests(unittest.IsolatedAsyncioTestCase):
                     srv.openlist_removes.clear()
                     await plugin.pick_baidu_files(umo, "1", force=True)
                     for _ in range(50):
-                        if len(ctx.sent) >= 2 and not plugin._jobs_by_id:
+                        if (
+                            len(ctx.sent) >= 2
+                            and not plugin._jobs_by_id
+                            and not plugin._background_tasks
+                        ):
                             break
                         await asyncio.sleep(0.05)
                     self.assertEqual(len(srv.openlist_removes), 1)

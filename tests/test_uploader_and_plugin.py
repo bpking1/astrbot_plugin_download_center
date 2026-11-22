@@ -11,7 +11,7 @@ except ImportError:
     import _bootstrap  # noqa: F401
 from aiohttp import web
 
-from astrbot.api.message_components import File
+from astrbot.api.message_components import File, Plain
 
 from astrbot_plugin_download_center.main import DownloadCenterPlugin
 from astrbot_plugin_download_center.uploader import STREAM_CHUNK_SIZE, upload_file_to_session
@@ -52,7 +52,89 @@ class _FakeContext:
         return self.adapter
 
 
+class _FakeEvent:
+    def __init__(self, umo: str) -> None:
+        self.unified_msg_origin = umo
+
+
 class UploaderAndPluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tool_notifies_with_dl_hint_before_upload_and_returns_none(self) -> None:
+        payload = b"fast-tool-payload-" * 5_000
+
+        async def handle_file(request: web.Request) -> web.StreamResponse:
+            if request.method == "HEAD":
+                return web.Response(
+                    status=200,
+                    headers={
+                        "Content-Length": str(len(payload)),
+                        "Accept-Ranges": "bytes",
+                        "ETag": '"fast-v1"',
+                    },
+                )
+            return web.Response(status=200, body=payload)
+
+        app = web.Application()
+        app.router.add_route("*", "/fast.zip", handle_file)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "127.0.0.1", 0)
+        await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                ctx = _FakeContext()
+                cfg = {
+                    "enabled": True,
+                    "max_file_size_mb": 300,
+                    "cache_ttl_hours": 72,
+                    "cache_max_total_mb": 1024,
+                    "block_private_network": False,
+                }
+                plugin = DownloadCenterPlugin(ctx, cfg, data_dir=Path(tmp))
+                await plugin.initialize()
+                try:
+                    ev = _FakeEvent("ai小猪:GroupMessage:530698338")
+                    url = f"http://127.0.0.1:{port}/fast.zip"
+
+                    res1 = await plugin.tool_download_and_send_file(ev, url)
+                    self.assertIsNone(res1)
+                    for _ in range(50):
+                        if len(ctx.sent) >= 2 and not plugin._jobs_by_id:
+                            break
+                        await asyncio.sleep(0.05)
+
+                    self.assertEqual(len(ctx.sent), 2)
+                    self.assertIsInstance(ctx.sent[0][1][0], Plain)
+                    notice1 = ctx.sent[0][1][0].text
+                    self.assertIn("已开始后台下载", notice1)
+                    self.assertIn("查进度：/dl list", notice1)
+                    self.assertIn("取消：/dl cancel ", notice1)
+                    self.assertIsInstance(ctx.sent[1][1][0], File)
+
+                    # Cache hit: notice must still arrive before uploaded File, and tool returns None
+                    res2 = await plugin.tool_download_and_send_file(ev, url)
+                    self.assertIsNone(res2)
+                    for _ in range(30):
+                        if len(ctx.sent) >= 4:
+                            break
+                        await asyncio.sleep(0.05)
+
+                    self.assertEqual(len(ctx.sent), 4)
+                    self.assertIsInstance(ctx.sent[2][1][0], Plain)
+                    self.assertIn("命中本地缓存", ctx.sent[2][1][0].text)
+                    self.assertIsInstance(ctx.sent[3][1][0], File)
+
+                    # Error: returns error text to LLM without sending a start notice
+                    res3 = await plugin.tool_download_and_send_file(ev, "ftp://invalid.example/a.bin")
+                    self.assertIsInstance(res3, str)
+                    self.assertTrue(res3.startswith("无法开始下载："))
+                    self.assertEqual(len(ctx.sent), 4)
+                finally:
+                    await plugin.terminate()
+        finally:
+            await runner.cleanup()
+
     async def test_shared_path_and_napcat_stream_upload(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sample = Path(tmp) / "demo.bin"

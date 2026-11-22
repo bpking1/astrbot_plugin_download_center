@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -296,6 +297,33 @@ class DownloadCenterPlugin(Star):
         except Exception as exc:
             self.logger.warning("发送通知到 %s 失败：%s", umo, exc)
 
+    def _make_notifier(
+        self,
+        umo: str,
+    ) -> tuple[Callable[[str], Awaitable[None]], Callable[[], bool]]:
+        notified = False
+
+        async def _notify(text: str) -> None:
+            nonlocal notified
+            notified = True
+            await self._send_text(umo, text)
+
+        return _notify, lambda: notified
+
+    @staticmethod
+    async def _emit_and_release(
+        notify_fn: Callable[[str], Awaitable[None]] | None,
+        msg: str,
+        gate: asyncio.Event | None = None,
+    ) -> str:
+        try:
+            if notify_fn is not None:
+                await notify_fn(msg)
+        finally:
+            if gate is not None:
+                gate.set()
+        return msg
+
     async def _ensure_initialized(self) -> CacheStore:
         if self.store is None or self._semaphore is None:
             await self.initialize()
@@ -309,6 +337,7 @@ class DownloadCenterPlugin(Star):
         custom_filename: str = "",
         force: bool = False,
         password: str = "",
+        notify_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Validate, deduplicate, and schedule a background download + upload."""
         if not self._cfg_bool("enabled", True):
@@ -328,6 +357,7 @@ class DownloadCenterPlugin(Star):
                 password=password,
                 custom_filename=clean_name,
                 force=force,
+                notify_fn=notify_fn,
             )
 
         store = await self._ensure_initialized()
@@ -336,17 +366,27 @@ class DownloadCenterPlugin(Star):
         await validate_url_and_ssrf(clean_url, options)
         orig_key = url_key(clean_url)
 
+        fast_reply: str | None = None
+        fast_gate: asyncio.Event | None = None
         async with self._lock:
             existing_job = self._inflight.get(orig_key)
             if existing_job is not None:
                 if umo not in existing_job.waiters:
                     existing_job.waiters[umo] = clean_name
-                return self._format_inflight_reply(existing_job)
-
-            if not force and not self._cfg_bool("revalidate_cache_with_head", False):
+                fast_reply = self._format_inflight_reply(existing_job)
+            elif not force and not self._cfg_bool("revalidate_cache_with_head", False):
                 cached = store.lookup(clean_url)
                 if cached is not None:
-                    return self._schedule_cached_upload(umo, cached, clean_name)
+                    fast_gate = asyncio.Event() if notify_fn is not None else None
+                    fast_reply = self._schedule_cached_upload(
+                        umo,
+                        cached,
+                        clean_name,
+                        start_gate=fast_gate,
+                    )
+
+        if fast_reply is not None:
+            return await self._emit_and_release(notify_fn, fast_reply, fast_gate)
 
         async with create_http_session(options) as session:
             probe_res = await probe(
@@ -358,50 +398,60 @@ class DownloadCenterPlugin(Star):
 
         final_key = url_key(probe_res.final_url)
 
+        gate: asyncio.Event | None = None
+        reply: str | None = None
         async with self._lock:
             existing_job = self._inflight.get(orig_key) or self._inflight.get(final_key)
             if existing_job is not None:
                 if umo not in existing_job.waiters:
                     existing_job.waiters[umo] = clean_name
-                return self._format_inflight_reply(existing_job)
-
-            if not force:
+                reply = self._format_inflight_reply(existing_job)
+            elif not force:
                 cached = store.lookup(clean_url) or store.lookup(probe_res.final_url)
                 if cached is not None and self._is_cache_still_fresh(cached, probe_res):
-                    return self._schedule_cached_upload(umo, cached, clean_name)
+                    gate = asyncio.Event() if notify_fn is not None else None
+                    reply = self._schedule_cached_upload(
+                        umo,
+                        cached,
+                        clean_name,
+                        start_gate=gate,
+                    )
 
-            job_id = uuid.uuid4().hex[:8]
-            job = DownloadJob(
-                job_id=job_id,
-                url=clean_url,
-                url_key=orig_key,
-                final_url_key=final_key,
-                filename=probe_res.filename,
-                total_size=probe_res.total_size,
-                waiters={umo: clean_name},
-            )
-            self._inflight[orig_key] = job
-            self._inflight[final_key] = job
-            self._jobs_by_id[job_id] = job
-            job.task = asyncio.create_task(
-                self._run_download_job(job, options, probe_res),
-                name=f"download_job_{job_id}",
-            )
-            self._track_task(job.task)
+            if reply is None:
+                gate = asyncio.Event() if notify_fn is not None else None
+                job_id = uuid.uuid4().hex[:8]
+                job = DownloadJob(
+                    job_id=job_id,
+                    url=clean_url,
+                    url_key=orig_key,
+                    final_url_key=final_key,
+                    filename=probe_res.filename,
+                    total_size=probe_res.total_size,
+                    waiters={umo: clean_name},
+                )
+                self._inflight[orig_key] = job
+                self._inflight[final_key] = job
+                self._jobs_by_id[job_id] = job
+                job.task = asyncio.create_task(
+                    self._run_download_job(job, options, probe_res, start_gate=gate),
+                    name=f"download_job_{job_id}",
+                )
+                self._track_task(job.task)
+                mode_hint = (
+                    f"{options.connections} 并发分片"
+                    if probe_res.accept_ranges
+                    and probe_res.total_size is not None
+                    and probe_res.total_size >= options.chunk_size_bytes
+                    and options.connections > 1
+                    else "单流"
+                )
+                reply = (
+                    f"已开始后台下载「{probe_res.filename}」（{format_bytes(probe_res.total_size)}，"
+                    f"{mode_hint}，任务 {job.job_id}），完成后会自动上传。"
+                    f"查进度：/dl list，取消：/dl cancel {job.job_id}"
+                )
 
-        mode_hint = (
-            f"{options.connections} 并发分片"
-            if probe_res.accept_ranges
-            and probe_res.total_size is not None
-            and probe_res.total_size >= options.chunk_size_bytes
-            and options.connections > 1
-            else "单流"
-        )
-        return (
-            f"已开始后台下载「{probe_res.filename}」（{format_bytes(probe_res.total_size)}，"
-            f"{mode_hint}，任务 {job.job_id}），完成后会自动上传。"
-            f"查进度：/dl list，取消：/dl cancel {job.job_id}"
-        )
+        return await self._emit_and_release(notify_fn, reply, gate)
 
     def _validate_baidu_ready(self, bcfg: BaiduConfig) -> str | None:
         if not bcfg.enabled:
@@ -424,6 +474,7 @@ class DownloadCenterPlugin(Star):
         password: str = "",
         custom_filename: str = "",
         force: bool = False,
+        notify_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         bcfg = self._build_baidu_config()
         err_msg = self._validate_baidu_ready(bcfg)
@@ -468,15 +519,23 @@ class DownloadCenterPlugin(Star):
             return "该百度网盘分享中没有可下载的文件（可能仅包含空文件夹）。"
 
         if len(files) == 1 and not truncated:
-            return await self._schedule_baidu_file(
-                umo=umo,
-                meta=meta,
-                share_file=files[0],
-                bcfg=bcfg,
-                options=options,
-                custom_filename=custom_filename,
-                force=force,
-            )
+            gate = asyncio.Event() if notify_fn is not None else None
+            try:
+                reply = await self._schedule_baidu_file(
+                    umo=umo,
+                    meta=meta,
+                    share_file=files[0],
+                    bcfg=bcfg,
+                    options=options,
+                    custom_filename=custom_filename,
+                    force=force,
+                    start_gate=gate,
+                )
+            except BaseException:
+                if gate is not None:
+                    gate.set()
+                raise
+            return await self._emit_and_release(notify_fn, reply, gate)
 
         share_session = self._share_sessions.put(umo, meta, files, truncated=truncated)
         lines = [
@@ -498,6 +557,7 @@ class DownloadCenterPlugin(Star):
         indices_spec: str,
         share_code: str = "",
         force: bool = False,
+        notify_fn: Callable[[str], Awaitable[None]] | None = None,
     ) -> str:
         """Select and start downloading one or more files from a listed Baidu share."""
         if not self._cfg_bool("enabled", True):
@@ -531,25 +591,37 @@ class DownloadCenterPlugin(Star):
             randsk=share_session.randsk,
         )
         options = self._build_options()
+        batch_gate = asyncio.Event() if notify_fn is not None else None
         replies: list[str] = []
-        for idx in indices:
-            share_file = share_session.get_file(idx)
-            if share_file is None:
-                replies.append(f"#{idx} 不存在。")
-                continue
-            try:
-                msg = await self._schedule_baidu_file(
-                    umo=umo,
-                    meta=meta,
-                    share_file=share_file,
-                    bcfg=bcfg,
-                    options=options,
-                    force=force,
-                )
-            except DownloadError as exc:
-                msg = f"#{idx}「{share_file.filename}」：{exc}"
-            replies.append(msg)
-        return "\n".join(replies)
+        any_scheduled = False
+        try:
+            for idx in indices:
+                share_file = share_session.get_file(idx)
+                if share_file is None:
+                    replies.append(f"#{idx} 不存在。")
+                    continue
+                try:
+                    msg = await self._schedule_baidu_file(
+                        umo=umo,
+                        meta=meta,
+                        share_file=share_file,
+                        bcfg=bcfg,
+                        options=options,
+                        force=force,
+                        start_gate=batch_gate,
+                    )
+                    any_scheduled = True
+                except DownloadError as exc:
+                    msg = f"#{idx}「{share_file.filename}」：{exc}"
+                replies.append(msg)
+
+            reply = "\n".join(replies)
+            if notify_fn is not None and any_scheduled:
+                await notify_fn(reply)
+            return reply
+        finally:
+            if batch_gate is not None:
+                batch_gate.set()
 
     def _reserve_baidu_quota_locked(self, bcfg: BaiduConfig) -> None:
         if bcfg.max_downloads_per_day <= 0:
@@ -573,6 +645,7 @@ class DownloadCenterPlugin(Star):
         options: DownloadOptions,
         custom_filename: str = "",
         force: bool = False,
+        start_gate: asyncio.Event | None = None,
     ) -> str:
         store = await self._ensure_initialized()
         send_name = sanitize_filename(custom_filename) if custom_filename else sanitize_filename(share_file.filename)
@@ -594,7 +667,12 @@ class DownloadCenterPlugin(Star):
             if not force:
                 cached = store.lookup("", canonical_key=ckey)
                 if cached is not None:
-                    return self._schedule_cached_upload(umo, cached, custom_filename)
+                    return self._schedule_cached_upload(
+                        umo,
+                        cached,
+                        custom_filename,
+                        start_gate=start_gate,
+                    )
 
             self._reserve_baidu_quota_locked(bcfg)
 
@@ -611,7 +689,14 @@ class DownloadCenterPlugin(Star):
             self._inflight[ckey_hash] = job
             self._jobs_by_id[job_id] = job
             job.task = asyncio.create_task(
-                self._run_baidu_download_job(job, meta, share_file, bcfg, options),
+                self._run_baidu_download_job(
+                    job,
+                    meta,
+                    share_file,
+                    bcfg,
+                    options,
+                    start_gate=start_gate,
+                ),
                 name=f"baidu_download_job_{job_id}",
             )
             self._track_task(job.task)
@@ -629,6 +714,7 @@ class DownloadCenterPlugin(Star):
         share_file: BaiduShareFile,
         bcfg: BaiduConfig,
         options: DownloadOptions,
+        start_gate: asyncio.Event | None = None,
     ) -> None:
         assert self.store is not None
         assert self._semaphore is not None
@@ -642,6 +728,8 @@ class DownloadCenterPlugin(Star):
         remote_created = False
 
         try:
+            if start_gate is not None:
+                await start_gate.wait()
             async with self._semaphore:
                 if job.cancel_event.is_set():
                     raise DownloadCancelledError("下载任务已取消。")
@@ -780,12 +868,18 @@ class DownloadCenterPlugin(Star):
             return False
         return True
 
-    def _schedule_cached_upload(self, umo: str, entry: CacheEntry, custom_filename: str) -> str:
+    def _schedule_cached_upload(
+        self,
+        umo: str,
+        entry: CacheEntry,
+        custom_filename: str,
+        start_gate: asyncio.Event | None = None,
+    ) -> str:
         assert self.store is not None
         send_name = sanitize_filename(custom_filename) if custom_filename else entry.filename
         self.store.pin(entry.sha256)
         task = asyncio.create_task(
-            self._upload_entry_to_waiters(entry, {umo: send_name}),
+            self._upload_entry_to_waiters(entry, {umo: send_name}, start_gate=start_gate),
             name=f"upload_cached_{entry.sha256[:8]}",
         )
         self._track_task(task)
@@ -796,6 +890,7 @@ class DownloadCenterPlugin(Star):
         job: DownloadJob,
         options: DownloadOptions,
         probe_res: ProbeResult,
+        start_gate: asyncio.Event | None = None,
     ) -> None:
         assert self.store is not None
         assert self._semaphore is not None
@@ -803,6 +898,8 @@ class DownloadCenterPlugin(Star):
         entry: CacheEntry | None = None
 
         try:
+            if start_gate is not None:
+                await start_gate.wait()
             async with self._semaphore:
                 if job.cancel_event.is_set():
                     raise DownloadCancelledError("下载任务已取消。")
@@ -877,10 +974,13 @@ class DownloadCenterPlugin(Star):
         self,
         entry: CacheEntry,
         waiters: dict[str, str],
+        start_gate: asyncio.Event | None = None,
     ) -> None:
         assert self.store is not None
         upload_mode = self._cfg_str("upload_mode", "shared_path")
         try:
+            if start_gate is not None:
+                await start_gate.wait()
             for umo, send_name in waiters.items():
                 try:
                     await upload_file_to_session(
@@ -908,8 +1008,12 @@ class DownloadCenterPlugin(Star):
         filename: str = "",
         force: bool = False,
         password: str = "",
-    ) -> str:
+    ) -> str | None:
         """当用户明确请求帮忙下载文件直链或百度网盘分享链接（pan.baidu.com/s/...）并发送到当前聊天时调用。禁止用于 B站、抖音、小红书、微博、YouTube 等社交媒体的视频或图文链接。
+
+        注意：
+        - 即使用户此前尝试下载同一链接失败，只要用户再次要求下载或重试，也必须重新调用本工具，不得凭历史对话直接拒绝。
+        - 调用本工具时不要提前输出“正在下载”等过渡文字；开始下载后工具会直接向用户发送包含 `/dl` 进度查询与取消指令的通知。
 
         Args:
             url(string): 要下载的文件直链或百度网盘分享链接（必须是 http 或 https 链接）
@@ -918,14 +1022,17 @@ class DownloadCenterPlugin(Star):
             password(string): 百度网盘 4 位提取码（若链接或文本中带提取码可一并传入）
         """
         umo = getattr(event, "unified_msg_origin", "")
+        notify, was_notified = self._make_notifier(umo)
         try:
-            return await self.submit_download(
+            reply = await self.submit_download(
                 umo=umo,
                 url=url,
                 custom_filename=filename,
                 force=force,
                 password=password,
+                notify_fn=notify,
             )
+            return None if was_notified() else reply
         except DownloadError as exc:
             return f"无法开始下载：{exc}"
         except Exception as exc:
@@ -939,8 +1046,8 @@ class DownloadCenterPlugin(Star):
         indices: str,
         share_code: str = "",
         force: bool = False,
-    ) -> str:
-        """当此前列出了百度网盘多文件清单，用户回复要下载第几个文件时调用。
+    ) -> str | None:
+        """当此前列出了百度网盘多文件清单，用户回复要下载第几个文件时调用。开始下载后工具会直接向用户发送包含 `/dl` 进度查询与取消指令的通知，调用前无需输出过渡文字。
 
         Args:
             indices(string): 要下载的文件编号，例如 '2'、'1 3'、'1,2' 或 '1-3'
@@ -948,13 +1055,16 @@ class DownloadCenterPlugin(Star):
             force(boolean): 是否忽略本地缓存强制重新下载，默认 false
         """
         umo = getattr(event, "unified_msg_origin", "")
+        notify, was_notified = self._make_notifier(umo)
         try:
-            return await self.pick_baidu_files(
+            reply = await self.pick_baidu_files(
                 umo=umo,
                 indices_spec=indices,
                 share_code=share_code,
                 force=force,
+                notify_fn=notify,
             )
+            return None if was_notified() else reply
         except DownloadError as exc:
             return f"选号下载失败：{exc}"
         except Exception as exc:
@@ -995,15 +1105,19 @@ class DownloadCenterPlugin(Star):
             if len(pick_args) >= 2 and self._share_sessions.get(umo, share_code=pick_args[0]) is not None:
                 share_code = pick_args[0]
                 pick_args = pick_args[1:]
+            notify, was_notified = self._make_notifier(umo)
+            reply = ""
             try:
                 reply = await self.pick_baidu_files(
                     umo=umo,
                     indices_spec=" ".join(pick_args),
                     share_code=share_code,
+                    notify_fn=notify,
                 )
             except DownloadError as exc:
                 reply = f"选号下载失败：{exc}"
-            yield event.plain_result(reply)
+            if not was_notified() and reply:
+                yield event.plain_result(reply)
             return
 
         if sub == "clean":
@@ -1047,16 +1161,20 @@ class DownloadCenterPlugin(Star):
                     if not is_baidu_pan_url(cleaned_tok) and _PLAIN_PWD_RE.fullmatch(cleaned_tok):
                         explicit_pwd = cleaned_tok
                         break
+            notify, was_notified = self._make_notifier(umo)
+            reply = ""
             try:
                 reply = await self.submit_download(
                     umo=umo,
                     url=rest,
                     force=force,
                     password=explicit_pwd,
+                    notify_fn=notify,
                 )
             except DownloadError as exc:
                 reply = f"无法开始下载：{exc}"
-            yield event.plain_result(reply)
+            if not was_notified() and reply:
+                yield event.plain_result(reply)
             return
 
         candidate_url = tokens[0]
@@ -1070,16 +1188,20 @@ class DownloadCenterPlugin(Star):
         else:
             custom_name = " ".join(tokens[1:]).strip()
 
+        notify, was_notified = self._make_notifier(umo)
+        reply = ""
         try:
             reply = await self.submit_download(
                 umo=umo,
                 url=candidate_url,
                 custom_filename=custom_name,
                 force=force,
+                notify_fn=notify,
             )
         except DownloadError as exc:
             reply = f"无法开始下载：{exc}"
-        yield event.plain_result(reply)
+        if not was_notified() and reply:
+            yield event.plain_result(reply)
 
     async def _cancel_job(self, job_id: str) -> str:
         async with self._lock:
