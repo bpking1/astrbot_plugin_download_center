@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import unittest
+from unittest.mock import patch
 
 try:
     from . import _bootstrap  # noqa: F401
@@ -22,6 +25,7 @@ from astrbot_plugin_download_center.downloader import (
     create_http_session,
     download,
     probe,
+    validate_url_and_ssrf,
 )
 
 
@@ -292,3 +296,37 @@ class DownloaderTests(unittest.IsolatedAsyncioTestCase):
             async with create_http_session(opts_redir) as session:
                 with self.assertRaises(SsrfBlockedError):
                     await probe(session, f"http://localhost:{srv.port}/jump", opts_redir)
+
+    async def test_transparent_proxy_fake_ip_allowed_for_domains_only(self) -> None:
+        opts = DownloadOptions(block_private_network=True, allowed_private_hosts=())
+        dns_table = {
+            "release-assets.githubusercontent.com": "198.18.7.112",
+            "evil-lan.example.com": "192.168.10.2",
+            "evil-loop.example.com": "127.0.0.1",
+            "openlist": "198.18.0.5",
+            "nas.local": "198.18.0.5",
+            "svc.internal": "198.18.0.5",
+        }
+
+        async def fake_getaddrinfo(host: str, port: int, type: int = 0):
+            ip = dns_table.get(host)
+            if not ip:
+                raise OSError(f"unmapped host {host}")
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))]
+
+        loop = asyncio.get_running_loop()
+        with patch.object(loop, "getaddrinfo", side_effect=fake_getaddrinfo):
+            allowed_url = "https://release-assets.githubusercontent.com/a.apk"
+            self.assertEqual(await validate_url_and_ssrf(allowed_url, opts), allowed_url)
+
+            for blocked_url in (
+                "http://198.18.7.112/a.apk",
+                "https://evil-lan.example.com/a.apk",
+                "https://evil-loop.example.com/a.apk",
+                "http://openlist/a.apk",
+                "http://nas.local/a.apk",
+                "http://svc.internal/a.apk",
+            ):
+                with self.subTest(url=blocked_url):
+                    with self.assertRaises(SsrfBlockedError):
+                        await validate_url_and_ssrf(blocked_url, opts)

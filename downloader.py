@@ -208,11 +208,20 @@ def _infer_filename(
     return sanitize_filename(f"download{ext or '.bin'}")
 
 
-def _is_blocked_ip(ip_str: str) -> bool:
+_TRANSPARENT_PROXY_FAKE_IP_NET = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_blocked_ip(ip_str: str, *, allow_fake_ip: bool = False) -> bool:
     clean = ip_str.split("%", 1)[0]
     ip = ipaddress.ip_address(clean)
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
+    if (
+        allow_fake_ip
+        and isinstance(ip, ipaddress.IPv4Address)
+        and ip in _TRANSPARENT_PROXY_FAKE_IP_NET
+    ):
+        return False
     return (
         ip.is_private
         or ip.is_loopback
@@ -249,9 +258,15 @@ async def validate_url_and_ssrf(url: str, options: DownloadOptions) -> str:
             raise DownloadError(f"域名解析失败（{host}）：{exc}") from exc
         if not infos:
             raise DownloadError(f"域名未解析到可用地址：{host}")
+        normalized_host = host.rstrip(".")
+        # 透明代理 Fake-IP 模式通常会将外网域名解析到 198.18.0.0/15，仅针对公网域名结果放行
+        allow_fake_ip = (
+            "." in normalized_host
+            and not normalized_host.endswith((".local", ".localhost", ".internal"))
+        )
         for info in infos:
             sockaddr = info[4]
-            if sockaddr and _is_blocked_ip(sockaddr[0]):
+            if sockaddr and _is_blocked_ip(sockaddr[0], allow_fake_ip=allow_fake_ip):
                 raise SsrfBlockedError(f"已拦截内网或本机地址：{host} ({sockaddr[0]})")
         return raw
 
